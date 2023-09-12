@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
@@ -13,6 +14,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <limits.h>
+#include "../include/linux/initramfs.h"
 
 /*
  * Original work by Jeff Garzik
@@ -37,11 +39,120 @@ static bool do_file_mtime;
 static bool do_csum = false;
 static int outfd = STDOUT_FILENO;
 static unsigned int dalign;
+static char metadata_path[] = "/tmp/cpio-metadata-XXXXXX";
+static int metadata_fd = -1;
 
 struct file_handler {
 	const char *type;
 	int (*handler)(const char *line);
 };
+
+static enum metadata_types parse_metadata_type(char *arg)
+{
+	static char *metadata_type_str[TYPE__LAST] = {
+		[TYPE_NONE] = "none",
+		[TYPE_XATTR] = "xattr",
+	};
+	int i;
+
+	for (i = 0; i < TYPE__LAST; i++)
+		if (!strcmp(metadata_type_str[i], arg))
+			return i;
+
+	return TYPE_NONE;
+}
+
+static int cpio_mkfile(const char *name, const char *location,
+		       unsigned int mode, uid_t uid, gid_t gid,
+		       unsigned int nlinks);
+
+static int write_xattrs(const char *path)
+{
+	struct metadata_hdr hdr = { .c_version = 1, .c_type = TYPE_XATTR };
+	char str[sizeof(hdr.c_size) + 1];
+	char *xattr_list, *list_ptr, *xattr_value;
+	ssize_t list_len, name_len, value_len, len;
+	int ret = -EINVAL;
+
+	if (metadata_fd < 0)
+		return 0;
+
+	if (path == metadata_path)
+		return 0;
+
+	list_len = listxattr(path, NULL, 0);
+	if (list_len <= 0)
+		return 0;
+
+	list_ptr = xattr_list = malloc(list_len);
+	if (!list_ptr) {
+		fprintf(stderr, "out of memory\n");
+		return ret;
+	}
+
+	len = listxattr(path, xattr_list, list_len);
+	if (len != list_len)
+		goto out;
+
+	if (ftruncate(metadata_fd, 0))
+		goto out;
+
+	lseek(metadata_fd, 0, SEEK_SET);
+
+	while (list_ptr < xattr_list + list_len) {
+		name_len = strlen(list_ptr);
+
+		value_len = getxattr(path, list_ptr, NULL, 0);
+		if (value_len < 0) {
+			fprintf(stderr, "cannot get xattrs\n");
+			break;
+		}
+
+		if (value_len) {
+			xattr_value = malloc(value_len);
+			if (!xattr_value) {
+				fprintf(stderr, "out of memory\n");
+				break;
+			}
+		} else {
+			xattr_value = NULL;
+		}
+
+		len = getxattr(path, list_ptr, xattr_value, value_len);
+		if (len != value_len)
+			break;
+
+		snprintf(str, sizeof(str), "%.8lx",
+			 sizeof(hdr) + name_len + 1 + value_len);
+
+		memcpy(hdr.c_size, str, sizeof(hdr.c_size));
+
+		if (write(metadata_fd, &hdr, sizeof(hdr)) != sizeof(hdr))
+			break;
+
+		if (write(metadata_fd, list_ptr, name_len + 1) != name_len + 1)
+			break;
+
+		if (write(metadata_fd, xattr_value, value_len) != value_len)
+			break;
+
+		if (fsync(metadata_fd))
+			break;
+
+		list_ptr += name_len + 1;
+		free(xattr_value);
+		xattr_value = NULL;
+	}
+
+	free(xattr_value);
+out:
+	if (list_ptr != xattr_list + list_len)
+		return ret;
+
+	free(xattr_list);
+
+	return cpio_mkfile(METADATA_FILENAME, metadata_path, S_IFREG, 0, 0, 1);
+}
 
 static int push_buf(const char *name, size_t name_len)
 {
@@ -150,7 +261,8 @@ static int cpio_mkslink(const char *name, const char *target,
 	    push_buf(name, namesize) < 0 ||
 	    push_pad(padlen(offset, 4)) < 0 ||
 	    push_buf(target, targetsize) < 0 ||
-	    push_pad(padlen(offset, 4)) < 0)
+	    push_pad(padlen(offset, 4)) < 0 ||
+	    write_xattrs(name) < 0)
 		return -1;
 
 	return 0;
@@ -204,7 +316,8 @@ static int cpio_mkgeneric(const char *name, unsigned int mode,
 	offset += len;
 
 	if (len != CPIO_HDR_LEN ||
-	    push_rest(name, namesize) < 0)
+	    push_rest(name, namesize) < 0 ||
+	    write_xattrs(name) < 0)
 		return -1;
 
 	return 0;
@@ -305,7 +418,8 @@ static int cpio_mknod(const char *name, unsigned int mode,
 	offset += len;
 
 	if (len != CPIO_HDR_LEN ||
-	    push_rest(name, namesize) < 0)
+	    push_rest(name, namesize) < 0 ||
+	    write_xattrs(name) < 0)
 		return -1;
 
 	return 0;
@@ -490,7 +604,7 @@ static int cpio_mkfile(const char *name, const char *location,
 		name += namesize;
 	}
 	ino++;
-	rc = 0;
+	rc = write_xattrs(location);
 
 error:
 	if (file >= 0)
@@ -650,10 +764,11 @@ int main (int argc, char *argv[])
 	int ec = 0;
 	int line_nr = 0;
 	const char *filename;
+	enum metadata_types metadata_type = TYPE_NONE;
 
 	default_mtime = time(NULL);
 	while (1) {
-		int opt = getopt(argc, argv, "t:cho:a:");
+		int opt = getopt(argc, argv, "t:e:cho:a:");
 		char *invalid;
 
 		if (opt == -1)
@@ -668,6 +783,9 @@ int main (int argc, char *argv[])
 				exit(1);
 			}
 			do_file_mtime = true;
+			break;
+		case 'e':
+			metadata_type = parse_metadata_type(optarg);
 			break;
 		case 'c':
 			do_csum = true;
@@ -720,6 +838,13 @@ int main (int argc, char *argv[])
 			filename, strerror(errno));
 		usage(argv[0]);
 		exit(1);
+	}
+	if (metadata_type != TYPE_NONE) {
+		metadata_fd = mkstemp(metadata_path);
+		if (metadata_fd < 0) {
+			fprintf(stderr, "cannot create temporary file\n");
+			exit(1);
+		}
 	}
 
 	while (fgets(line, LINE_SIZE, cpio_list)) {
@@ -777,5 +902,7 @@ int main (int argc, char *argv[])
 	if (ec == 0)
 		ec = cpio_trailer();
 
+	if (metadata_type != TYPE_NONE)
+		close(metadata_fd);
 	exit(ec);
 }
