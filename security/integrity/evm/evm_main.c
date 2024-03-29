@@ -1037,11 +1037,13 @@ static void evm_file_release(struct file *file)
 static void evm_post_path_mknod(struct mnt_idmap *idmap, struct dentry *dentry)
 {
 	struct inode *inode = d_backing_inode(dentry);
-	struct evm_iint_cache *iint = evm_iint_inode(inode);
+	struct evm_iint_cache *iint;
 
-	if (!S_ISREG(inode->i_mode))
+	/* path_post_mknod hook might pass dentries without attached inode. */
+	if (!inode || !S_ISREG(inode->i_mode))
 		return;
 
+	iint = evm_iint_inode(inode);
 	if (iint)
 		iint->flags |= EVM_NEW_FILE;
 }

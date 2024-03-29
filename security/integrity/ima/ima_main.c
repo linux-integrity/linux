@@ -719,10 +719,11 @@ static void ima_post_create_tmpfile(struct mnt_idmap *idmap,
 static void ima_post_path_mknod(struct mnt_idmap *idmap, struct dentry *dentry)
 {
 	struct ima_iint_cache *iint;
-	struct inode *inode = dentry->d_inode;
+	struct inode *inode = d_backing_inode(dentry);
 	int must_appraise;
 
-	if (!ima_policy_flag || !S_ISREG(inode->i_mode))
+	/* path_post_mknod hook might pass dentries without attached inode. */
+	if (!ima_policy_flag || !inode || !S_ISREG(inode->i_mode))
 		return;
 
 	must_appraise = ima_must_appraise(idmap, inode, MAY_ACCESS,
